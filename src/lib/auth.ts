@@ -1,8 +1,11 @@
 // NextAuth imported only where needed to avoid build-time issues
 import KeycloakProvider from 'next-auth/providers/keycloak';
+import CredentialsProvider from 'next-auth/providers/credentials';
 import type { NextAuthOptions } from 'next-auth';
 import type { JWT } from 'next-auth/jwt';
 import { decodeJwt } from 'jose';
+import { KEYCLOAK_CONFIG, NEXTAUTH_CONFIG, SESSION_CONFIG } from '@/lib/constants/keycloak';
+import type { CredentialsUser } from '@/types/auth';
 
 /**
  * Takes a token, and returns a new token with updated
@@ -16,8 +19,8 @@ async function refreshAccessToken(token: JWT): Promise<JWT> {
     }
 
     const details = {
-      client_id: process.env.KEYCLOAK_CLIENT_ID || 'your-client-id',
-      client_secret: process.env.KEYCLOAK_CLIENT_SECRET || 'your-client-secret',
+      client_id: KEYCLOAK_CONFIG.CLIENT_ID,
+      client_secret: KEYCLOAK_CONFIG.CLIENT_SECRET,
       grant_type: 'refresh_token',
       refresh_token: token.refreshToken,
     };
@@ -30,7 +33,7 @@ async function refreshAccessToken(token: JWT): Promise<JWT> {
     });
 
     const formData = formBody.join('&');
-    const url = `${process.env.KEYCLOAK_BASE_URL || 'http://localhost:8080/realms/your-realm/protocol/openid-connect'}/token`;
+    const url = KEYCLOAK_CONFIG.TOKEN_URL;
     
     const response = await fetch(url, {
       method: 'POST',
@@ -64,42 +67,136 @@ async function refreshAccessToken(token: JWT): Promise<JWT> {
 
 export const authOptions: NextAuthOptions = {
   providers: [
+    // Keycloak OAuth Provider (原有的跳转登录方式)
     KeycloakProvider({
-      clientId: process.env.KEYCLOAK_CLIENT_ID || 'your-client-id',
-      clientSecret: process.env.KEYCLOAK_CLIENT_SECRET || 'your-client-secret',
-      issuer: process.env.KEYCLOAK_BASE_URL || 'http://localhost:8080/realms/your-realm',
+      clientId: KEYCLOAK_CONFIG.CLIENT_ID,
+      clientSecret: KEYCLOAK_CONFIG.CLIENT_SECRET,
+      issuer: KEYCLOAK_CONFIG.BASE_URL,
       authorization: {
         params: {
           scope: 'openid',
         },
       },
     }),
+    
+    // Credentials Provider (新的用户名密码登录方式)
+    CredentialsProvider({
+      id: "keycloak-credentials",
+      name: "Keycloak Credentials",
+      credentials: {
+        username: {
+          label: "用户名",
+          type: "text",
+          placeholder: "请输入用户名"
+        },
+        password: {
+          label: "密码",
+          type: "password",
+          placeholder: "请输入密码"
+        }
+      },
+      async authorize(credentials) {
+        if (!credentials?.username || !credentials?.password) {
+          throw new Error('缺少用户名或密码');
+        }
+
+        try {
+          // 调用我们的代理认证 API
+          const baseUrl = NEXTAUTH_CONFIG.URL;
+          const response = await fetch(`${baseUrl}/api/auth/keycloak-login`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              username: credentials.username,
+              password: credentials.password,
+            }),
+          });
+
+          const data = await response.json();
+
+          if (!response.ok) {
+            console.error('Keycloak authentication failed:', data);
+            throw new Error(data.message || '认证失败');
+          }
+
+          if (data.success && data.tokens) {
+            // 解析访问令牌获取用户信息
+            const userInfo = decodeJwt(data.tokens.access_token);
+            
+            return {
+              id: userInfo.sub as string,
+              name: userInfo.name as string || userInfo.preferred_username as string,
+              email: userInfo.email as string,
+              image: userInfo.picture as string,
+              // 保存令牌信息用于会话管理
+              accessToken: data.tokens.access_token,
+              refreshToken: data.tokens.refresh_token,
+              expiresAt: data.tokens.expires_at,
+            };
+          }
+
+          throw new Error('认证响应格式无效');
+        } catch (error) {
+          console.error('Authorization error:', error);
+          throw new Error(error instanceof Error ? error.message : '认证服务不可用');
+        }
+      }
+    }),
   ],
   session: {
     strategy: 'jwt',
-    maxAge: 30 * 24 * 60 * 60, // 30 days
+    maxAge: SESSION_CONFIG.MAX_AGE,
   },
   jwt: {
-    maxAge: 60 * 60 * 24 * 30, // 30 days
+    maxAge: SESSION_CONFIG.JWT_MAX_AGE,
   },
   callbacks: {
     async jwt({ token, account, user }) {
       // Persist the OAuth access_token and refresh_token to the token right after signin
       if (account && user) {
-        console.log('Account data received:', {
+        console.log('JWT Callback - Account data received:', {
+          type: account.type,
+          provider: account.provider,
           expires_in: account.expires_in,
           refresh_expires_in: account.refresh_expires_in,
-          expires_at: account.expires_at
+          expires_at: account.expires_at,
+          access_token: account.access_token ? 'present' : 'missing',
+          refresh_token: account.refresh_token ? 'present' : 'missing'
         });
+        console.log('JWT Callback - User data received:', user);
 
-        // 计算 access token 过期时间
+        // 处理不同类型的认证提供者
+        let accessToken: string | undefined;
+        let refreshToken: string | undefined;
         let accessTokenExpired: number = 0;
-        
+        let refreshTokenExpired: number;
+
+        // 对于 Credentials Provider，令牌在 user 对象中
+        if (account.type === 'credentials' && user && 'accessToken' in user) {
+          console.log('Processing Credentials Provider tokens');
+          const credentialsUser = user as CredentialsUser;
+          accessToken = credentialsUser.accessToken;
+          refreshToken = credentialsUser.refreshToken;
+          
+          // 如果有 expiresAt 直接使用
+          if (credentialsUser.expiresAt) {
+            accessTokenExpired = credentialsUser.expiresAt * 1000 - 15000;
+          }
+        } 
+        // 对于 OAuth Provider，令牌在 account 对象中
+        else {
+          console.log('Processing OAuth Provider tokens');
+          accessToken = account.access_token;
+          refreshToken = account.refresh_token;
+        }
+
         // 尝试从 JWT token 本身解析过期时间（最准确的方法）
-        if (account.access_token) {
+        if (accessToken) {
           try {
             // 使用官方推荐的 jose 库解析 JWT
-            const tokenPayload = decodeJwt(account.access_token);
+            const tokenPayload = decodeJwt(accessToken);
             if (tokenPayload.exp) {
               // JWT 中的 exp 是秒级时间戳，转换为毫秒并减去缓冲时间
               accessTokenExpired = tokenPayload.exp * 1000 - 15000;
@@ -125,7 +222,6 @@ export const authOptions: NextAuthOptions = {
         }
 
         // 计算 refresh token 过期时间
-        let refreshTokenExpired: number;
         if (account.refresh_expires_in) {
           refreshTokenExpired = Date.now() + ((account.refresh_expires_in as number) - 15) * 1000;
         } else {
@@ -135,8 +231,8 @@ export const authOptions: NextAuthOptions = {
 
         return {
           ...token,
-          accessToken: account.access_token,
-          refreshToken: account.refresh_token,
+          accessToken,
+          refreshToken,
           accessTokenExpired,
           refreshTokenExpired,
           user,
@@ -164,10 +260,11 @@ export const authOptions: NextAuthOptions = {
     },
   },
   pages: {
-    signIn: '/auth/signin',
+    signIn: '/auth/signin', // 自定义登录页面
+    error: '/auth/error',   // 自定义错误页面（可选）
   },
   debug: process.env.NODE_ENV === 'development',
-  secret: process.env.SECRET || process.env.NEXTAUTH_SECRET || 'fallback-secret-key',
+  secret: NEXTAUTH_CONFIG.SECRET,
 };
 
 // Export NextAuth for use in API routes only
